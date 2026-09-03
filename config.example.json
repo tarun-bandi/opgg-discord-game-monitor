@@ -1,0 +1,16 @@
+{
+  "timeZone": "America/New_York",
+  "maxShowMoreClicks": 10,
+  "pageTimeoutMs": 30000,
+  "summoners": [
+    {
+      "region": "na",
+      "riotId": "Example Player#NA1",
+      "puuid": "optional-public-puuid",
+      "baseline": {
+        "completedMatchId": "copy-the-current-newest-match-id-here",
+        "startedAt": "2026-01-01T00:00:00Z"
+      }
+    }
+  ]
+}

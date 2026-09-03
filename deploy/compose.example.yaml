@@ -1,0 +1,10 @@
+services:
+  monitor:
+    image: ghcr.io/tarun-bandi/opgg-discord-game-monitor:latest
+    restart: unless-stopped
+    env_file:
+      - ../.env
+    volumes:
+      - ../config.local.json:/app/config.local.json:ro
+      - ../.secrets:/app/.secrets:ro
+      - ../work:/app/work

@@ -1,0 +1,14 @@
+.env
+.secrets/
+config.local.json
+node_modules/
+outputs/
+playwright-report/
+test-results/
+work/*.json
+work/*.lock
+!work/.gitkeep
+
+.DS_Store
+npm-debug.log*
+pnpm-debug.log*

@@ -1,0 +1,194 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a commit-addressed image to GHCR
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: pipeline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run tests
+        run: pnpm test
+      - name: Check JavaScript syntax
+        run: pnpm run check
+
+  security:
+    name: Supply-chain checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Reject committed webhook secrets
+        run: pnpm run secret-check
+      - name: Audit production dependencies
+        run: pnpm audit --prod --audit-level high
+
+  container:
+    name: Container smoke test
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && !inputs.publish)
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          push: false
+          tags: opgg-discord-game-monitor:ci
+          cache-from: type=gha,scope=monitor-image
+          cache-to: type=gha,mode=max,scope=monitor-image
+      - name: Verify image and secret exclusions
+        run: >-
+          docker run --rm --entrypoint sh opgg-discord-game-monitor:ci -ec
+          'test ! -e .env;
+          test ! -e config.local.json;
+          test ! -d .secrets;
+          test ! -e work/lol-monitor-state.json;
+          node --check src/cli.js'
+
+  publish:
+    name: Publish GHCR image
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Normalize image name
+        id: image
+        shell: bash
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.image }}
+          tags: |
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+      - name: Build and publish multi-architecture image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          provenance: false
+          sbom: true
+          cache-from: type=gha,scope=monitor-image
+          cache-to: type=gha,mode=max,scope=monitor-image
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  summary:
+    name: Delivery summary
+    if: always()
+    needs: [test, security, container, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm required jobs
+        shell: bash
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          CONTAINER_RESULT: ${{ needs.container.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+        run: |
+          [[ "$TEST_RESULT" == success ]]
+          [[ "$SECURITY_RESULT" == success ]]
+          [[ "$CONTAINER_RESULT" =~ ^(success|skipped)$ ]]
+          [[ "$PUBLISH_RESULT" =~ ^(success|skipped)$ ]]
+      - name: Write published image details
+        if: needs.publish.result == 'success'
+        env:
+          IMAGE: ${{ needs.publish.outputs.image }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
+          printf '`%s@%s`\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

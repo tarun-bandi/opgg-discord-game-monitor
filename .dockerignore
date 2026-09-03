@@ -1,0 +1,10 @@
+.env
+.git
+.github
+.secrets
+config.local.json
+node_modules
+outputs
+test
+work/*.json
+work/*.lock
